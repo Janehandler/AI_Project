@@ -23,12 +23,12 @@ jobs:
 
       - name: AI Code Fix & Self-Improvement
         run: |
-          python3 ai_self_improve.py
+          python3 self_improve_ai.py  # This runs the AI improvement script
 
       - name: Commit & Push Changes
         run: |
-          git config --global user.name "AI Coder"
-          git config --global user.email "ai_coder@example.com"
+          git config --global user.name "Janehandler"
+          git config --global user.email "ender.zn.1914@gmail.com"
           git add .
           git commit -m "AI Auto-Updated Code"
           git push
