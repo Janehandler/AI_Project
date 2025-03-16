@@ -26,9 +26,11 @@ jobs:
           python3 self_improve_ai.py  # This runs the AI improvement script
 
       - name: Commit & Push Changes
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           git config --global user.name "Janehandler"
           git config --global user.email "ender.zn.1914@gmail.com"
           git add .
-          git commit -m "AI Auto-Updated Code"
-          git push
+          git commit -m "AI Auto-Updated Code" || echo "No changes to commit"
+          git push https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/Janehandler/AI_Project.git main
