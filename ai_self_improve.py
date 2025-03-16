@@ -1,8 +1,8 @@
 import openai
 import os
 
-# Set OpenAI API Key (replace with yours)
-openai.api_key = "YOUR_OPENAI_API_KEY"
+# Set OpenAI API Key
+openai.api_key = "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"
 
 def analyze_code(file_path):
     """ Reads a Python file and suggests improvements using OpenAI """
@@ -11,16 +11,18 @@ def analyze_code(file_path):
     
     prompt = f"Analyze the following Python code and suggest improvements:\n\n{code}"
     
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
-    return response["choices"][0]["message"]["content"]
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"❌ OpenAI API Error: {e}"
 
 def improve_files():
     """ Goes through all AI files and improves them """
-    ai_files = [f for f in os.listdir() if f.endswith(".py")]
+    ai_files = [f for f in os.listdir() if f.endswith(".py") and f != "self_improve_ai.py"]
     
     for file in ai_files:
         improvements = analyze_code(file)
