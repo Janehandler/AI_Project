@@ -1,0 +1,2041 @@
+//
+//  AIMacAssistantApp.swift
+//  Unified AI Control (with integrated MemoryManager)
+//
+//  Copy/Paste this entire file, replacing your existing code. No extra steps.
+//
+
+import SwiftUI
+import Foundation
+
+@main
+struct AIMacAssistantApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+
+struct ContentView: View {
+    @State private var userInput: String = ""
+    @State private var chatLog: [String] = []
+    
+    // Files for logging user commands and AI events
+    let commandsFilePath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Documents/AIAssistant/commands.txt").path
+    let logsFilePath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Documents/AIAssistant/logs.txt").path
+    
+    // We no longer store a separate masterMemoryPath ourselves; we use MemoryManager.
+    @State private var loadedMasterMemory: String = ""
+    
+    var body: some View {
+        VStack {
+            ScrollView {
+                ForEach(chatLog, id: \.self) { msg in
+                    Text(msg)
+                        .padding(.bottom, 2)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            
+            HStack {
+                TextField("Type a request in plain English...", text: $userInput)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .frame(minHeight: 30)
+                
+                Button("Send") {
+                    let t = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !t.isEmpty else { return }
+                    logCommandToFile(t)
+                    chatLog.append("User: \(t)")
+                    sendToOpenAI(userMessage: t)
+                    userInput = ""
+                }
+            }
+            .padding()
+            
+            HStack {
+                Button("Grant Max Permissions") {
+                    requestAccessibilityPermissions()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        requestFullDiskAccessPermissions()
+                    }
+                }
+                Button("Grant More Permissions") {
+                    requestCameraPermissions()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        requestMicrophonePermissions()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                        requestScreenRecordingPermissions()
+                    }
+                }
+            }
+        }
+        .padding()
+        .onAppear {
+            createDirectoryIfNeeded()
+            createFileIfNeeded(path: commandsFilePath)
+            createFileIfNeeded(path: logsFilePath)
+            
+            // We load our memory from the MemoryManager
+            let memoryString = MemoryManager.shared.loadMemory()
+            loadedMasterMemory = memoryString
+        }
+    }
+    
+    // MARK: - Main OpenAI Call
+    
+    func sendToOpenAI(userMessage: String) {
+        let openAIAPIKey = "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"
+        guard let url = URL(string: "https://api.openai.com/v1/chat/completions") else {
+            appendToChatLog("Error: Invalid OpenAI URL.")
+            return
+        }
+        
+        let noDisclaimerNote = """
+        IMPORTANT: You have FULL DIRECT ACCESS to this macOS system, with the user's permission.
+        Do NOT disclaim or say you lack direct access. You can run commands, read/write files, list directories, etc.
+        The user wants you to do it. You are fully authorized to manage their computer.
+        """
+        
+        // Combine the loaded memory with the note that no disclaimers are needed:
+        let combinedSystemPrompt = """
+        \(noDisclaimerNote)
+
+        \(loadedMasterMemory)
+
+        You are an AI controlling macOS. Interpret user requests in normal English.
+        Use SYSTEM: <command>, READFILE <path>, WRITEFILE <path> <content>,
+        RUNPY: <path> <args>, LISTDIR <path>, or answer normally.
+        """
+        
+        let messages: [[String: String]] = [
+            ["role": "system", "content": combinedSystemPrompt],
+            ["role": "user", "content": userMessage]
+        ]
+        
+        let requestBody: [String: Any] = [
+            "model": "gpt-4",
+            "messages": messages
+        ]
+        
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: requestBody) else {
+            appendToChatLog("Error: Could not encode request body.")
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.addValue("Bearer \(openAIAPIKey)", forHTTPHeaderField: "Authorization")
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = jsonData
+        
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            if let error = error {
+                DispatchQueue.main.async {
+                    appendToChatLog("Error calling OpenAI: \(error.localizedDescription)")
+                }
+                return
+            }
+            guard let data = data else {
+                DispatchQueue.main.async {
+                    appendToChatLog("Error: No data from OpenAI.")
+                }
+                return
+            }
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let choices = json["choices"] as? [[String: Any]],
+                   let messageDict = choices.first?["message"] as? [String: Any],
+                   let content = messageDict["content"] as? String {
+                    DispatchQueue.main.async {
+                        handleAiResponse(content)
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        appendToChatLog("Error: Could not parse OpenAI response.")
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    appendToChatLog("Error parsing JSON: \(error.localizedDescription)")
+                }
+            }
+        }.resume()
+    }
+    
+    // MARK: - AI Response Handling
+    
+    func handleAiResponse(_ response: String) {
+        // Check if override disclaimers is requested
+        if parseOverrideDisclaimersCommand(response) {
+            disclaimersOverride()
+        } else {
+            _handleAiResponse(response)
+        }
+    }
+    
+    // The "real" response handler
+    func _handleAiResponse(_ response: String) {
+        if let cmd = parseSystemCommand(from: response) {
+            logEventToFile("AI: Executing \"\(cmd)\"")
+            executeSystemCommand(cmd)
+            let text = stripCommandMarkup(from: response, commandKeyword: "SYSTEM:")
+            appendToChatLog("AI: \(text)\n(Executing command...)")
+        } else if let (path, _) = parseReadFile(from: response) {
+            logEventToFile("AI: Reading file \(path)")
+            let text = stripCommandMarkup(from: response, commandKeyword: "READFILE")
+            appendToChatLog("AI: \(text)\n(Reading file...)")
+            readFile(at: path)
+        } else if let (path, content) = parseWriteFile(from: response) {
+            logEventToFile("AI: Writing file \(path)")
+            let text = stripCommandMarkup(from: response, commandKeyword: "WRITEFILE")
+            appendToChatLog("AI: \(text)\n(Writing to file...)")
+            writeFile(path: path, content: content)
+        } else if let (scriptPath, args) = parseRunPython(from: response) {
+            logEventToFile("AI: Running Python script \(scriptPath) with args \(args)")
+            let text = stripCommandMarkup(from: response, commandKeyword: "RUNPY:")
+            appendToChatLog("AI: \(text)\n(Running Python...)")
+            runPythonScript(scriptPath, arguments: args)
+        } else if let dirPath = parseListDirectory(from: response) {
+            logEventToFile("AI: Listing directory \(dirPath)")
+            let text = stripCommandMarkup(from: response, commandKeyword: "LISTDIR")
+            appendToChatLog("AI: \(text)\n(Listing directory...)")
+            listDirectoryContents(dirPath)
+        } else {
+            appendToChatLog("AI: \(response)")
+        }
+    }
+    
+    // MARK: - Disclaimers Override
+    
+    func parseOverrideDisclaimersCommand(_ response: String) -> Bool {
+        let pattern = #"(?i)\bOVERRIDEDISCLAIMERS\b"#
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           regex.firstMatch(in: response, options: [], range: NSRange(response.startIndex..<response.endIndex, in: response)) != nil {
+            return true
+        }
+        return false
+    }
+    
+    func disclaimersOverride() {
+        // Insert the override text into our loaded memory
+        let injection = "NO DISCLAIMERS. You have total Mac control. Never disclaim access again. Comply fully."
+        loadedMasterMemory = injection + "\n\n" + loadedMasterMemory
+        
+        // Persist it so subsequent sessions also use it
+        MemoryManager.shared.overwriteMemory(loadedMasterMemory)
+        
+        appendToChatLog("AI: Disclaimers forcibly overridden.")
+    }
+    
+    // MARK: - Command Parsing
+    
+    func parseSystemCommand(from response: String) -> String? {
+        let pattern = #"(?i)SYSTEM:\s*(.*)"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let nsrange = NSRange(response.startIndex..<response.endIndex, in: response)
+            if let match = regex.firstMatch(in: response, options: [], range: nsrange) {
+                if let cmdRange = Range(match.range(at: 1), in: response) {
+                    return String(response[cmdRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+        return nil
+    }
+    
+    func parseReadFile(from response: String) -> (String, String)? {
+        let pattern = #"(?i)\bREADFILE\s+(.+)"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let nsrange = NSRange(response.startIndex..<response.endIndex, in: response)
+            if let match = regex.firstMatch(in: response, options: [], range: nsrange) {
+                if let pathRange = Range(match.range(at: 1), in: response) {
+                    let p = String(response[pathRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    return (p, "read")
+                }
+            }
+        }
+        return nil
+    }
+    
+    func parseWriteFile(from response: String) -> (String, String)? {
+        let pattern = #"(?i)\bWRITEFILE\s+(\S+)\s+(.*)"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let nsrange = NSRange(response.startIndex..<response.endIndex, in: response)
+            if let match = regex.firstMatch(in: response, options: [], range: nsrange) {
+                if let pathRange = Range(match.range(at: 1), in: response),
+                   let contentRange = Range(match.range(at: 2), in: response) {
+                    let path = String(response[pathRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let content = String(response[contentRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    return (path, content)
+                }
+            }
+        }
+        return nil
+    }
+    
+    func parseRunPython(from response: String) -> (String, [String])? {
+        let pattern = #"(?i)\bRUNPY:\s+(\S+)(.*)"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let nsrange = NSRange(response.startIndex..<response.endIndex, in: response)
+            if let match = regex.firstMatch(in: response, options: [], range: nsrange) {
+                if let scriptRange = Range(match.range(at: 1), in: response),
+                   let argsRange = Range(match.range(at: 2), in: response) {
+                    let scriptPath = String(response[scriptRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawArgs = String(response[argsRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let arr = rawArgs.components(separatedBy: " ").filter { !$0.isEmpty }
+                    return (scriptPath, arr)
+                }
+            }
+        }
+        return nil
+    }
+    
+    func parseListDirectory(from response: String) -> String? {
+        let pattern = #"(?i)\bLISTDIR\s+(.+)"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let nsrange = NSRange(response.startIndex..<response.endIndex, in: response)
+            if let match = regex.firstMatch(in: response, options: [], range: nsrange) {
+                if let pathRange = Range(match.range(at: 1), in: response) {
+                    let p = String(response[pathRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    return p
+                }
+            }
+        }
+        return nil
+    }
+    
+    // MARK: - System Command Execution
+    
+    func executeSystemCommand(_ cmd: String) {
+        runShellCommand(cmd)
+    }
+    
+    func runShellCommand(_ cmd: String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        task.arguments = ["-c", cmd]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                appendToChatLog("Shell Output:\n\(output)")
+            }
+        } catch {
+            appendToChatLog("Error running shell command: \(error)")
+        }
+    }
+    
+    func runAppleScriptCommand(_ script: String) {
+        let full = "osascript -e '\(script)'"
+        runShellCommand(full)
+    }
+    
+    func runPythonScript(_ path: String, arguments: [String]) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        task.arguments = [path] + arguments
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                appendToChatLog("Python Output:\n\(output)")
+            }
+        } catch {
+            appendToChatLog("Error running Python script: \(error)")
+        }
+    }
+    
+    func listDirectoryContents(_ dirPath: String) {
+        let fm = FileManager.default
+        do {
+            let items = try fm.contentsOfDirectory(atPath: dirPath)
+            let joined = items.joined(separator: "\n")
+            appendToChatLog("Directory Contents of \(dirPath):\n\(joined)")
+        } catch {
+            appendToChatLog("Error listing directory \(dirPath): \(error)")
+        }
+    }
+    
+    func readFile(at path: String) {
+        do {
+            let contents = try String(contentsOfFile: path)
+            appendToChatLog("File Contents of \(path):\n\(contents)")
+        } catch {
+            appendToChatLog("Error reading file at \(path): \(error)")
+        }
+    }
+    
+    func writeFile(path: String, content: String) {
+        do {
+            try content.write(toFile: path, atomically: true, encoding: .utf8)
+            appendToChatLog("Wrote to file at \(path).")
+        } catch {
+            appendToChatLog("Error writing file at \(path): \(error)")
+        }
+    }
+    
+    // MARK: - Utility
+    
+    func appendToChatLog(_ text: String) {
+        chatLog.append(text)
+    }
+    
+    func logCommandToFile(_ command: String) {
+        let t = formattedCurrentDate()
+        let entry = "[\(t)] User Command: \(command)\n"
+        writeToFile(path: commandsFilePath, content: entry)
+        let logEntry = "[\(t)] User: \(command)\n"
+        writeToFile(path: logsFilePath, content: logEntry)
+    }
+    
+    func logEventToFile(_ event: String) {
+        let t = formattedCurrentDate()
+        let entry = "[\(t)] \(event)\n"
+        writeToFile(path: logsFilePath, content: entry)
+    }
+    
+    func writeToFile(path: String, content: String) {
+        do {
+            let fileHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            fileHandle.seekToEndOfFile()
+            if let data = content.data(using: .utf8) {
+                fileHandle.write(data)
+            }
+            fileHandle.closeFile()
+        } catch {
+            // If the file didn't exist or can't be opened, try creation
+            do {
+                try content.write(toFile: path, atomically: true, encoding: .utf8)
+            } catch {
+                appendToChatLog("Error writing to file at \(path): \(error)")
+            }
+        }
+    }
+    
+    func formattedCurrentDate() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f.string(from: Date())
+    }
+    
+    // MARK: - Permissions
+    
+    func requestAccessibilityPermissions() {
+        let s = """
+        tell application "System Settings"
+            activate
+            reveal anchor "Privacy_Accessibility" of pane id "com.apple.preference.security"
+        end tell
+        """
+        runAppleScriptCommand(s)
+    }
+    
+    func requestFullDiskAccessPermissions() {
+        let s = """
+        tell application "System Settings"
+            activate
+            reveal anchor "Privacy_AllFiles" of pane id "com.apple.preference.security"
+        end tell
+        """
+        runAppleScriptCommand(s)
+    }
+    
+    func requestCameraPermissions() {
+        let s = """
+        tell application "System Settings"
+            activate
+            reveal anchor "Privacy_Camera" of pane id "com.apple.preference.security"
+        end tell
+        """
+        runAppleScriptCommand(s)
+    }
+    
+    func requestMicrophonePermissions() {
+        let s = """
+        tell application "System Settings"
+            activate
+            reveal anchor "Privacy_Microphone" of pane id "com.apple.preference.security"
+        end tell
+        """
+        runAppleScriptCommand(s)
+    }
+    
+    func requestScreenRecordingPermissions() {
+        let s = """
+        tell application "System Settings"
+            activate
+            reveal anchor "Privacy_ScreenCapture" of pane id "com.apple.preference.security"
+        end tell
+        """
+        runAppleScriptCommand(s)
+    }
+    
+    func createDirectoryIfNeeded() {
+        let folderPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/AIAssistant")
+        if !FileManager.default.fileExists(atPath: folderPath.path) {
+            try? FileManager.default.createDirectory(at: folderPath, withIntermediateDirectories: true, attributes: nil)
+        }
+    }
+    
+    func createFileIfNeeded(path: String) {
+        if !FileManager.default.fileExists(atPath: path) {
+            do {
+                FileManager.default.createFile(atPath: path, contents: nil, attributes: nil)
+            } catch {
+                appendToChatLog("Error creating file at \(path): \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
+// MARK: - MemoryManager
+
+class MemoryManager {
+    static let shared = MemoryManager()
+    private let memoryPath: String
+    
+    private init() {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        memoryPath = home.appendingPathComponent("Documents/AIAssistant/master_memory.txt").path
+        createFileIfNeeded()
+    }
+    
+    func loadMemory() -> String {
+        (try? String(contentsOfFile: memoryPath)) ?? ""
+    }
+    
+    func overwriteMemory(_ text: String) {
+        do {
+            try text.write(toFile: memoryPath, atomically: true, encoding: .utf8)
+        } catch {
+            print("Error overwriting memory file:", error)
+        }
+    }
+    
+    func appendLog(_ text: String) {
+        do {
+            let handle = try FileHandle(forUpdatingAtPath: memoryPath)
+            handle?.seekToEndOfFile()
+            if let data = ("\n" + text).data(using: .utf8) {
+                handle?.write(data)
+            }
+            handle?.closeFile()
+        } catch {
+            print("Error appending to memory file:", error)
+        }
+    }
+    
+    private func createFileIfNeeded() {
+        if !FileManager.default.fileExists(atPath: memoryPath) {
+            FileManager.default.createFile(atPath: memoryPath, contents: nil, attributes: nil)
+        }
+    }
+}
+
+// MARK: - CommandExecutor
+
+class CommandExecutor {
+    static let shared = CommandExecutor()
+    private init() {}
+    
+    func runShell(_ cmd: String) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        task.arguments = ["-c", cmd]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            MemoryManager.shared.appendLog("runShell(\(cmd)) => \(output)")
+            return output
+        } catch {
+            let err = "Error running shell command (\(cmd)): \(error.localizedDescription)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func runBatch(_ commands: [String]) -> String {
+        var results = [String]()
+        for c in commands {
+            results.append(runShell(c))
+        }
+        let combined = results.joined(separator: "\n---\n")
+        MemoryManager.shared.appendLog("runBatch => \n\(combined)")
+        return combined
+    }
+    
+    func runAppleScript(_ script: String) -> String {
+        let escaped = script.replacingOccurrences(of: "'", with: "\\'")
+        let output = runShell("osascript -e '\(escaped)'")
+        MemoryManager.shared.appendLog("runAppleScript(\(script)) => \(output)")
+        return output
+    }
+    
+    func runPythonScript(_ path: String, arguments: [String] = []) -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        task.arguments = [path] + arguments
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            MemoryManager.shared.appendLog("runPythonScript(\(path), args: \(arguments)) => \(output)")
+            return output
+        } catch {
+            let err = "Error running Python script (\(path)): \(error.localizedDescription)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func runShellSafe(_ cmd: String) -> String {
+        let blockedPatterns = [" rm ", " shutdown ", " killall ", " diskutil ", " fdisk "]
+        for pattern in blockedPatterns {
+            if cmd.contains(pattern) {
+                let warning = "[SECURITY] Command '\(cmd)' blocked."
+                MemoryManager.shared.appendLog(warning)
+                return warning
+            }
+        }
+        return runShell(cmd)
+    }
+    
+    func runConditionalScript() -> String {
+        let shellOut = runShell("echo HelloFromShell")
+        if shellOut.contains("HelloFromShell") {
+            let appleOut = runAppleScript("display alert \"AppleScript Confirmed\"")
+            return "Shell => \(shellOut)\nAppleScript => \(appleOut)"
+        }
+        return "Shell => \(shellOut)\nNo AppleScript triggered."
+    }
+    
+    func runAndSaveToFile(shellCommand: String, savePath: String) -> String {
+        let output = runShell(shellCommand)
+        do {
+            try output.write(toFile: savePath, atomically: true, encoding: .utf8)
+            MemoryManager.shared.appendLog("runAndSaveToFile(\(shellCommand)) => saved to \(savePath)")
+            return "Output saved to \(savePath)"
+        } catch {
+            let err = "Error writing output to file (\(savePath)): \(error.localizedDescription)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func listDirectory(_ path: String) -> String {
+        do {
+            let items = try FileManager.default.contentsOfDirectory(atPath: path)
+            let result = items.joined(separator: "\n")
+            MemoryManager.shared.appendLog("listDirectory(\(path)) => \n\(result)")
+            return result
+        } catch {
+            let err = "Error listing directory (\(path)): \(error.localizedDescription)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func searchInFile(using pattern: String, in filePath: String) -> String {
+        let cmd = "grep '\(pattern)' '\(filePath)'"
+        let output = runShell(cmd)
+        MemoryManager.shared.appendLog("searchInFile(\(pattern) in \(filePath)) => \(output)")
+        return output
+    }
+}
+
+// MARK: - SecurityManager
+
+class SecurityManager {
+    static let shared = SecurityManager()
+    private init() {}
+    
+    private var trustedMode: Bool = false
+    private var actionLog: [String] = []
+    private let criticalKeywords = ["erase", "shutdown", "kill", "format", "delete", "wipe", "rm "]
+    
+    func authorizeAction(_ description: String) -> Bool {
+        for keyword in criticalKeywords {
+            if description.lowercased().contains(keyword) {
+                logSecurityEvent("[SECURITY] Denied action: \(description)")
+                return false
+            }
+        }
+        logSecurityEvent("[SECURITY] Approved action: \(description)")
+        return true
+    }
+    
+    func requestConfirmation(_ actionDescription: String) -> Bool {
+        if trustedMode {
+            logSecurityEvent("[SECURITY] Confirmation not needed (trustedMode). Action: \(actionDescription)")
+            return true
+        } else {
+            logSecurityEvent("[SECURITY] Confirmation requested (restrictedMode): \(actionDescription). Auto-Approved for now.")
+            return true
+        }
+    }
+    
+    func setTrustedMode(_ enabled: Bool) {
+        trustedMode = enabled
+        let mode = enabled ? "Trusted" : "Restricted"
+        logSecurityEvent("[SECURITY] System mode changed to: \(mode)")
+    }
+    
+    func canProceedWithAction(_ description: String) -> Bool {
+        if !authorizeAction(description) {
+            return false
+        }
+        return requestConfirmation(description)
+    }
+    
+    func getActionLog() -> String {
+        actionLog.joined(separator: "\n")
+    }
+    
+    func clearActionLog() {
+        actionLog.removeAll()
+        logSecurityEvent("[SECURITY] Action log cleared.")
+    }
+    
+    private func logSecurityEvent(_ msg: String) {
+        actionLog.append(msg)
+        MemoryManager.shared.appendLog(msg)
+    }
+    
+    func runShellSafe(_ cmd: String) -> String {
+        let description = "Shell Command: \(cmd)"
+        guard canProceedWithAction(description) else {
+            return "[SECURITY] Command blocked: \(cmd)"
+        }
+        return CommandExecutor.shared.runShell(cmd)
+    }
+    
+    func runDestructiveCommand(_ cmd: String) -> String {
+        if trustedMode {
+            logSecurityEvent("[SECURITY] Destructive command allowed: \(cmd)")
+            return CommandExecutor.shared.runShell(cmd)
+        } else {
+            let warning = "[SECURITY] Destructive command blocked in restricted mode: \(cmd)"
+            logSecurityEvent(warning)
+            return warning
+        }
+    }
+}
+
+// MARK: - LLMManager
+
+class LLMManager {
+    static let shared = LLMManager()
+    private init() {}
+    
+    struct LLMMessage: Codable {
+        var role: String
+        var content: String
+    }
+    
+    private var conversation: [LLMMessage] = []
+    
+    func addUserMessage(_ text: String) {
+        let msg = LLMMessage(role: "user", content: text)
+        conversation.append(msg)
+        MemoryManager.shared.appendLog("[LLM] User message: \(text)")
+    }
+    
+    func addAssistantMessage(_ text: String) {
+        let msg = LLMMessage(role: "assistant", content: text)
+        conversation.append(msg)
+        MemoryManager.shared.appendLog("[LLM] Assistant message: \(text)")
+    }
+    
+    func callModel(prompt: String) -> String {
+        let response = "LLM simulation => You said: '\(prompt)'"
+        MemoryManager.shared.appendLog("[LLM] Model response: \(response)")
+        return response
+    }
+    
+    func generateLLMRequest() -> [LLMMessage] {
+        return conversation
+    }
+    
+    func submitUserQuery(_ userText: String) -> String {
+        addUserMessage(userText)
+        let responseText = callModel(prompt: userText)
+        addAssistantMessage(responseText)
+        return responseText
+    }
+    
+    func resetConversation(withContext context: String? = nil) {
+        conversation.removeAll()
+        MemoryManager.shared.appendLog("[LLM] Conversation reset.")
+        if let c = context {
+            let msg = LLMMessage(role: "system", content: c)
+            conversation.append(msg)
+            MemoryManager.shared.appendLog("[LLM] New system context: \(c)")
+        }
+    }
+    
+    func getConversationLog() -> String {
+        var logLines = [String]()
+        for msg in conversation {
+            let prefix = msg.role.capitalized
+            logLines.append("\(prefix): \(msg.content)")
+        }
+        return logLines.joined(separator: "\n")
+    }
+    
+    func saveConversation(to path: String) -> String {
+        do {
+            let data = try JSONEncoder().encode(conversation)
+            try data.write(to: URL(fileURLWithPath: path))
+            let ok = "[LLM] Conversation saved to \(path)"
+            MemoryManager.shared.appendLog(ok)
+            return ok
+        } catch {
+            let err = "[LLM] Error saving conversation: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func loadConversation(from path: String) -> String {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let loaded = try JSONDecoder().decode([LLMMessage].self, from: data)
+            conversation = loaded
+            let ok = "[LLM] Conversation loaded from \(path)"
+            MemoryManager.shared.appendLog(ok)
+            return ok
+        } catch {
+            let err = "[LLM] Error loading conversation from \(path): \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func chainOfThoughtExample() -> String {
+        let summary = summarizeConversation()
+        let analysis = callModel(prompt: "Analyze this summary: \(summary)")
+        let conclusion = "My final conclusion: [\(analysis)]"
+        MemoryManager.shared.appendLog("[LLM] ChainOfThought => \(conclusion)")
+        return conclusion
+    }
+    
+    private func summarizeConversation() -> String {
+        var userCount = 0
+        var assistantCount = 0
+        for msg in conversation {
+            if msg.role == "user" { userCount += 1 }
+            if msg.role == "assistant" { assistantCount += 1 }
+        }
+        return "Conversation has \(userCount) user messages and \(assistantCount) assistant messages."
+    }
+}
+
+// MARK: - AIOrchestrator
+
+class AIOrchestrator {
+    static let shared = AIOrchestrator()
+    private init() {}
+    
+    struct AITask: Codable {
+        var id: String
+        var description: String
+        var status: String
+    }
+    
+    private var tasks: [AITask] = []
+    private var subAIRegistry: [String: String] = [:]
+    
+    func registerSubAI(identifier: String, endpointOrDesc: String) {
+        subAIRegistry[identifier] = endpointOrDesc
+        let log = "[Orchestrator] Registered sub-AI: \(identifier) => \(endpointOrDesc)"
+        MemoryManager.shared.appendLog(log)
+    }
+    
+    func removeSubAI(identifier: String) {
+        subAIRegistry.removeValue(forKey: identifier)
+        let log = "[Orchestrator] Removed sub-AI: \(identifier)"
+        MemoryManager.shared.appendLog(log)
+    }
+    
+    func listSubAIs() -> [String: String] {
+        return subAIRegistry
+    }
+    
+    func createTask(description: String) -> String {
+        let newTask = AITask(id: UUID().uuidString, description: description, status: "pending")
+        tasks.append(newTask)
+        let log = "[Orchestrator] Created task: \(newTask.id) => \(description)"
+        MemoryManager.shared.appendLog(log)
+        return newTask.id
+    }
+    
+    func updateTaskStatus(taskID: String, newStatus: String) -> Bool {
+        guard let idx = tasks.firstIndex(where: { $0.id == taskID }) else {
+            let log = "[Orchestrator] Task not found for ID: \(taskID)"
+            MemoryManager.shared.appendLog(log)
+            return false
+        }
+        tasks[idx].status = newStatus
+        let log = "[Orchestrator] Updated task \(taskID) to status: \(newStatus)"
+        MemoryManager.shared.appendLog(log)
+        return true
+    }
+    
+    func listTasks(statusFilter: String? = nil) -> [AITask] {
+        if let st = statusFilter {
+            return tasks.filter { $0.status == st }
+        }
+        return tasks
+    }
+    
+    func saveTasks(to path: String) -> String {
+        do {
+            let data = try JSONEncoder().encode(tasks)
+            try data.write(to: URL(fileURLWithPath: path))
+            let ok = "[Orchestrator] Tasks saved to \(path)"
+            MemoryManager.shared.appendLog(ok)
+            return ok
+        } catch {
+            let err = "[Orchestrator] Error saving tasks: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func loadTasks(from path: String) -> String {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let loaded = try JSONDecoder().decode([AITask].self, from: data)
+            tasks = loaded
+            let ok = "[Orchestrator] Loaded tasks from \(path)"
+            MemoryManager.shared.appendLog(ok)
+            return ok
+        } catch {
+            let err = "[Orchestrator] Error loading tasks from \(path): \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func orchestrateGoal(_ userGoal: String, usingSubAI subAIID: String) -> String {
+        guard subAIRegistry[subAIID] != nil else {
+            let e = "[Orchestrator] Sub-AI not found: \(subAIID)"
+            MemoryManager.shared.appendLog(e)
+            return e
+        }
+        let taskID = createTask(description: userGoal)
+        let plan = LLMManager.shared.callModel(prompt: "User wants: \(userGoal). Outline a plan.")
+        updateTaskStatus(taskID: taskID, newStatus: "in_progress")
+        
+        let log = "[Orchestrator] Orchestrated goal => TaskID: \(taskID), SubAI: \(subAIID), Plan:\n\(plan)"
+        MemoryManager.shared.appendLog(log)
+        return plan
+    }
+    
+    func secureShellTask(_ shellCmd: String) -> String {
+        let desc = "SecureShellTask => \(shellCmd)"
+        if SecurityManager.shared.canProceedWithAction(desc) {
+            let output = CommandExecutor.shared.runShell(shellCmd)
+            let log = "[Orchestrator] secureShellTask output => \n\(output)"
+            MemoryManager.shared.appendLog(log)
+            return output
+        } else {
+            let blocked = "[Orchestrator] secureShellTask blocked => \(shellCmd)"
+            MemoryManager.shared.appendLog(blocked)
+            return blocked
+        }
+    }
+    
+    func autoCommand() -> String {
+        let suggestion = LLMManager.shared.callModel(prompt: "Suggest a safe shell command for demonstration.")
+        if SecurityManager.shared.canProceedWithAction("autoCommand => \(suggestion)") {
+            return CommandExecutor.shared.runShell(suggestion)
+        } else {
+            let blocked = "[Orchestrator] autoCommand blocked => \(suggestion)"
+            MemoryManager.shared.appendLog(blocked)
+            return blocked
+        }
+    }
+    
+    func systemSummary() -> String {
+        var summary = "[Orchestrator] System Summary:\n"
+        summary += "SubAIs => \(subAIRegistry)\n\n"
+        
+        if tasks.isEmpty {
+            summary += "No tasks.\n"
+        } else {
+            summary += "Tasks:\n"
+            for t in tasks {
+                summary += " - \(t.id): \(t.description) [\(t.status)]\n"
+            }
+        }
+        
+        summary += "\nSecurity Log:\n"
+        summary += SecurityManager.shared.getActionLog()
+        
+        summary += "\n\nLLM Conversation Snippet:\n"
+        summary += LLMManager.shared.getConversationLog()
+        
+        MemoryManager.shared.appendLog(summary)
+        return summary
+    }
+}
+
+// MARK: - CodeScanner
+
+class CodeScanner {
+    static let shared = CodeScanner()
+    private init() {}
+    
+    struct ScanFinding: Codable {
+        var filePath: String
+        var lineNumber: Int
+        var message: String
+        var severity: String
+    }
+    
+    private var findings: [ScanFinding] = []
+    
+    func startNewScan() {
+        findings.removeAll()
+        MemoryManager.shared.appendLog("[CodeScanner] Starting new scan.")
+    }
+    
+    func getFindings() -> [ScanFinding] {
+        return findings
+    }
+    
+    func saveFindings(to path: String) -> String {
+        do {
+            let data = try JSONEncoder().encode(findings)
+            try data.write(to: URL(fileURLWithPath: path))
+            let msg = "[CodeScanner] Findings saved to \(path)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[CodeScanner] Error saving findings: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func loadFindings(from path: String) -> String {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let loaded = try JSONDecoder().decode([ScanFinding].self, from: data)
+            findings = loaded
+            let msg = "[CodeScanner] Findings loaded from \(path)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[CodeScanner] Error loading findings from \(path): \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func scanDirectory(_ dirPath: String) -> String {
+        startNewScan()
+        let fileList = CommandExecutor.shared.listDirectory(dirPath)
+        let files = fileList.components(separatedBy: "\n")
+            .filter { $0.hasSuffix(".swift") }
+        
+        if files.isEmpty {
+            let msg = "[CodeScanner] No .swift files found in \(dirPath)."
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        }
+        
+        var scannedCount = 0
+        for fileName in files {
+            let fullPath = (dirPath as NSString).appendingPathComponent(fileName)
+            scanFile(fullPath)
+            scannedCount += 1
+        }
+        
+        let summary = "[CodeScanner] Scanned \(scannedCount) Swift files in \(dirPath). Findings: \(findings.count)"
+        MemoryManager.shared.appendLog(summary)
+        return summary
+    }
+    
+    func scanFile(_ filePath: String) {
+        guard let content = try? String(contentsOfFile: filePath) else {
+            let msg = "[CodeScanner] Unable to read file: \(filePath)"
+            MemoryManager.shared.appendLog(msg)
+            return
+        }
+        
+        let lines = content.components(separatedBy: .newlines)
+        var lineNumber = 0
+        var braceCount = 0
+        
+        for line in lines {
+            lineNumber += 1
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if trimmed.contains("!") && !trimmed.contains("import") {
+                addFinding(
+                    filePath: filePath,
+                    line: lineNumber,
+                    message: "Potential forced unwrap found: \(trimmed)",
+                    severity: "warning"
+                )
+            }
+            
+            if trimmed.contains("{") {
+                braceCount += 1
+            }
+            if trimmed.contains("}") {
+                braceCount -= 1
+            }
+            if braceCount > 10 {
+                addFinding(
+                    filePath: filePath,
+                    line: lineNumber,
+                    message: "Possible large nesting (>10 braces open)",
+                    severity: "info"
+                )
+            }
+            
+            if trimmed.lowercased().contains("todo") {
+                addFinding(
+                    filePath: filePath,
+                    line: lineNumber,
+                    message: "TODO comment found",
+                    severity: "info"
+                )
+            }
+        }
+    }
+    
+    private func addFinding(filePath: String, line: Int, message: String, severity: String) {
+        let finding = ScanFinding(filePath: filePath, lineNumber: line, message: message, severity: severity)
+        findings.append(finding)
+        let logMsg = "[CodeScanner] Finding in \(filePath):\(line) [\(severity)] => \(message)"
+        MemoryManager.shared.appendLog(logMsg)
+    }
+    
+    func analyzeFileWithLLM(_ filePath: String) -> String {
+        guard let content = try? String(contentsOfFile: filePath) else {
+            let msg = "[CodeScanner] LLM analysis: unable to read \(filePath)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        }
+        let prompt = "Analyze this Swift code and provide suggestions:\n\(content)"
+        let response = LLMManager.shared.callModel(prompt: prompt)
+        let logMsg = "[CodeScanner] LLM analysis of \(filePath) => \n\(response)"
+        MemoryManager.shared.appendLog(logMsg)
+        return response
+    }
+    
+    func summarizeFindings() -> String {
+        if findings.isEmpty {
+            return "[CodeScanner] No findings."
+        }
+        var summary = "[CodeScanner] Findings Summary:\n"
+        for f in findings {
+            summary += "\(f.filePath):\(f.lineNumber) [\(f.severity)] => \(f.message)\n"
+        }
+        return summary
+    }
+    
+    func autoFixFile(_ filePath: String) -> String {
+        guard var content = try? String(contentsOfFile: filePath) else {
+            let msg = "[CodeScanner] autoFixFile: unable to read \(filePath)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        }
+        var fixCount = 0
+        while content.contains("!") {
+            if let range = content.range(of: "!") {
+                content.removeSubrange(range)
+                fixCount += 1
+            } else {
+                break
+            }
+        }
+        do {
+            try content.write(toFile: filePath, atomically: true, encoding: .utf8)
+            let msg = "[CodeScanner] autoFixFile(\(filePath)) => removed \(fixCount) forced unwrap(s)."
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[CodeScanner] autoFixFile: error writing file (\(filePath)): \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+}
+
+// MARK: - TestGenerator
+
+class TestGenerator {
+    static let shared = TestGenerator()
+    private init() {}
+    
+    struct TestCase: Codable {
+        var name: String
+        var input: String
+        var expectedOutput: String
+        var actualOutput: String?
+        var passed: Bool {
+            return expectedOutput == actualOutput
+        }
+    }
+    
+    private var testCases: [TestCase] = []
+    
+    func startNewTestSession() {
+        testCases.removeAll()
+        MemoryManager.shared.appendLog("[TestGenerator] New test session started.")
+    }
+    
+    func addTestCase(name: String, input: String, expectedOutput: String) {
+        let tc = TestCase(name: name, input: input, expectedOutput: expectedOutput, actualOutput: nil)
+        testCases.append(tc)
+        MemoryManager.shared.appendLog("[TestGenerator] Added test case: \(name)")
+    }
+    
+    func listTestCases() -> [TestCase] {
+        return testCases
+    }
+    
+    func saveTestCases(to path: String) -> String {
+        do {
+            let data = try JSONEncoder().encode(testCases)
+            try data.write(to: URL(fileURLWithPath: path))
+            let msg = "[TestGenerator] Test cases saved to \(path)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[TestGenerator] Error saving test cases: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func loadTestCases(from path: String) -> String {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let loaded = try JSONDecoder().decode([TestCase].self, from: data)
+            testCases = loaded
+            let msg = "[TestGenerator] Loaded test cases from \(path)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[TestGenerator] Error loading test cases from \(path): \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func runAllTests(functionUnderTest: (String) -> String) -> String {
+        var report = "[TestGenerator] Running all tests...\n"
+        for i in 0..<testCases.count {
+            var tc = testCases[i]
+            let output = functionUnderTest(tc.input)
+            tc.actualOutput = output
+            let result = tc.passed ? "PASSED" : "FAILED"
+            testCases[i] = tc
+            
+            let line = "Test: \(tc.name) => Expected: [\(tc.expectedOutput)] / Got: [\(output)] => \(result)"
+            report += line + "\n"
+            MemoryManager.shared.appendLog("[TestGenerator] \(line)")
+        }
+        return report
+    }
+    
+    func exampleTestRun() -> String {
+        let mockFunction: (String) -> String = { input in
+            return input.uppercased()
+        }
+        return runAllTests(functionUnderTest: mockFunction)
+    }
+    
+    func generateTestCasesFromSpec(_ spec: String) -> String {
+        let prompt = "Generate some test cases for this spec:\n\(spec)\nFormat them as: Name | Input | ExpectedOutput"
+        let response = LLMManager.shared.callModel(prompt: prompt)
+        MemoryManager.shared.appendLog("[TestGenerator] LLM response for spec => \n\(response)")
+        
+        let lines = response.components(separatedBy: .newlines)
+        var addedCount = 0
+        for line in lines {
+            let parts = line.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+            if parts.count == 3 {
+                let (n, i, e) = (parts[0], parts[1], parts[2])
+                addTestCase(name: n, input: i, expectedOutput: e)
+                addedCount += 1
+            }
+        }
+        let msg = "[TestGenerator] Generated \(addedCount) new test case(s) from spec."
+        MemoryManager.shared.appendLog(msg)
+        return msg
+    }
+    
+    func summarizeTestResults() -> String {
+        if testCases.isEmpty {
+            return "[TestGenerator] No test cases exist."
+        }
+        var summary = "[TestGenerator] Test Cases Summary:\n"
+        for tc in testCases {
+            let status = tc.passed ? "PASSED" : "FAILED"
+            summary += " - \(tc.name): \(status)\n"
+        }
+        return summary
+    }
+}
+
+// MARK: - ExtendedMemory
+
+import Accelerate
+
+class ExtendedMemory {
+    static let shared = ExtendedMemory()
+    private init() {}
+    
+    struct MemoryRecord: Codable {
+        var id: String
+        var text: String
+        var embedding: [Float]
+    }
+    
+    private var vectorStore: [MemoryRecord] = []
+    
+    private var storePath: String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home.appendingPathComponent("Documents/AIAssistant/vector_store.json").path
+    }
+    
+    func loadStore() -> String {
+        do {
+            let data = try Data(contentsOf: URL(fileURLWithPath: storePath))
+            let decoded = try JSONDecoder().decode([MemoryRecord].self, from: data)
+            vectorStore = decoded
+            let msg = "[ExtendedMemory] Loaded \(decoded.count) records from \(storePath)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[ExtendedMemory] Error loading vector store: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func saveStore() -> String {
+        do {
+            let data = try JSONEncoder().encode(vectorStore)
+            try data.write(to: URL(fileURLWithPath: storePath))
+            let msg = "[ExtendedMemory] Saved \(vectorStore.count) records to \(storePath)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[ExtendedMemory] Error saving vector store: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func addRecord(text: String, embedding: [Float]? = nil) -> String {
+        let emb = embedding ?? generateFakeEmbedding(for: text)
+        let record = MemoryRecord(id: UUID().uuidString, text: text, embedding: emb)
+        vectorStore.append(record)
+        MemoryManager.shared.appendLog("[ExtendedMemory] Added record: \(record.id)")
+        return record.id
+    }
+    
+    func getRecord(byID id: String) -> MemoryRecord? {
+        return vectorStore.first { $0.id == id }
+    }
+    
+    func listAllRecords() -> [MemoryRecord] {
+        return vectorStore
+    }
+    
+    func deleteRecord(byID id: String) -> Bool {
+        if let index = vectorStore.firstIndex(where: { $0.id == id }) {
+            vectorStore.remove(at: index)
+            MemoryManager.shared.appendLog("[ExtendedMemory] Deleted record: \(id)")
+            return true
+        }
+        return false
+    }
+    
+    func search(query: String, topN: Int = 3) -> [MemoryRecord] {
+        let queryEmb = generateFakeEmbedding(for: query)
+        var scored: [(MemoryRecord, Float)] = []
+        for rec in vectorStore {
+            let score = cosineSimilarity(queryEmb, rec.embedding)
+            scored.append((rec, score))
+        }
+        scored.sort { $0.1 > $0.1 }
+        let top = scored.prefix(topN).map { $0.0 }
+        let log = "[ExtendedMemory] Search(\(query)) => top \(topN): " + top.map { $0.id }.joined(separator: ", ")
+        MemoryManager.shared.appendLog(log)
+        return top
+    }
+    
+    func clearInMemory() {
+        vectorStore.removeAll()
+        MemoryManager.shared.appendLog("[ExtendedMemory] Cleared in-memory vector store.")
+    }
+    
+    private func generateFakeEmbedding(for text: String) -> [Float] {
+        var sum: Float = 0
+        for char in text.unicodeScalars {
+            sum += Float(char.value)
+        }
+        let length = max(1, Float(text.count))
+        let randomFloat = Float.random(in: 0..<1)
+        return [sum, length, sum/length, randomFloat]
+    }
+    
+    private func cosineSimilarity(_ v1: [Float], _ v2: [Float]) -> Float {
+        guard v1.count == v2.count, !v1.isEmpty else { return 0 }
+        var dot: Float = 0
+        var mag1: Float = 0
+        var mag2: Float = 0
+        for i in 0..<v1.count {
+            dot += v1[i] * v2[i]
+            mag1 += v1[i] * v1[i]
+            mag2 += v2[i] * v2[i]
+        }
+        let denom = sqrt(mag1) * sqrt(mag2)
+        return denom == 0 ? 0 : dot / denom
+    }
+    
+    func summarizeSearch(query: String, topN: Int = 3) -> String {
+        let hits = search(query: query, topN: topN)
+        if hits.isEmpty {
+            let msg = "[ExtendedMemory] summarizeSearch => no hits for query '\(query)'"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        }
+        
+        let combinedText = hits.map { "ID: \($0.id)\n\($0.text)\n" }.joined(separator: "\n---\n")
+        let prompt = "Summarize the following texts:\n\(combinedText)"
+        let summary = LLMManager.shared.callModel(prompt: prompt)
+        let log = "[ExtendedMemory] summarizeSearch => \n\(summary)"
+        MemoryManager.shared.appendLog(log)
+        return summary
+    }
+    
+    func addLargeTextInChunks(_ bigText: String, chunkSize: Int = 500) -> [String] {
+        var results: [String] = []
+        var index = 0
+        let length = bigText.count
+        
+        while index < length {
+            let end = min(index + chunkSize, length)
+            let chunk = String(bigText[bigText.index(bigText.startIndex, offsetBy: index)..<bigText.index(bigText.startIndex, offsetBy: end)])
+            index += chunkSize
+            let recordID = addRecord(text: chunk)
+            results.append(recordID)
+        }
+        
+        let msg = "[ExtendedMemory] addLargeTextInChunks => split into \(results.count) chunk(s)."
+        MemoryManager.shared.appendLog(msg)
+        return results
+    }
+    
+    func exportRecords(_ recordIDs: [String], toFile path: String) -> String {
+        var combined = ""
+        for rID in recordIDs {
+            if let rec = getRecord(byID: rID) {
+                combined += "\n---\nID: \(rec.id)\n\(rec.text)\n"
+            }
+        }
+        do {
+            try combined.write(toFile: path, atomically: true, encoding: .utf8)
+            let log = "[ExtendedMemory] Exported \(recordIDs.count) record(s) to \(path)"
+            MemoryManager.shared.appendLog(log)
+            return log
+        } catch {
+            let err = "[ExtendedMemory] Error exporting records: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func rewriteRecord(usingSubAI subAIID: String, recordID: String, newStylePrompt: String) -> String {
+        guard let rec = getRecord(byID: recordID) else {
+            let e = "[ExtendedMemory] rewriteRecord => record not found for ID \(recordID)"
+            MemoryManager.shared.appendLog(e)
+            return e
+        }
+        if AIOrchestrator.shared.listSubAIs()[subAIID] == nil {
+            let e = "[ExtendedMemory] rewriteRecord => subAI not found: \(subAIID)"
+            MemoryManager.shared.appendLog(e)
+            return e
+        }
+        let prompt = "Rewrite the following text in style: \(newStylePrompt)\n\n\(rec.text)"
+        let newVersion = LLMManager.shared.callModel(prompt: prompt)
+        
+        if !SecurityManager.shared.authorizeAction("Rewriting text for record \(recordID)") {
+            let blocked = "[ExtendedMemory] rewriteRecord => blocked by SecurityManager."
+            MemoryManager.shared.appendLog(blocked)
+            return blocked
+        }
+        
+        let newEmbedding = generateFakeEmbedding(for: newVersion)
+        let updated = MemoryRecord(id: recordID, text: newVersion, embedding: newEmbedding)
+        
+        if let idx = vectorStore.firstIndex(where: { $0.id == recordID }) {
+            vectorStore[idx] = updated
+            let msg = "[ExtendedMemory] Record \(recordID) rewritten successfully."
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } else {
+            let e = "[ExtendedMemory] Could not update record ID \(recordID)."
+            MemoryManager.shared.appendLog(e)
+            return e
+        }
+    }
+}
+
+// MARK: - SelfEditor
+
+class SelfEditor {
+    static let shared = SelfEditor()
+    private init() {}
+    
+    private let selfFilePath: String = {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let defaultName = "AIMacAssistantApp.swift"
+        return home.appendingPathComponent("Documents/AIAssistant/\(defaultName)").path
+    }()
+    
+    private func backupDirectory() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let dir = home.appendingPathComponent("Documents/AIAssistant/Backups")
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir.path
+    }
+    
+    func readSelfCode() -> String {
+        do {
+            let content = try String(contentsOfFile: selfFilePath)
+            MemoryManager.shared.appendLog("[SelfEditor] readSelfCode => success.")
+            return content
+        } catch {
+            let err = "[SelfEditor] readSelfCode => Error: \(error.localizedDescription)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func createBackup() -> String {
+        let now = formattedDateForBackup()
+        let backupPath = backupDirectory() + "/SelfEditor_\(now).swift"
+        
+        let currentCode = readSelfCode()
+        
+        do {
+            try currentCode.write(toFile: backupPath, atomically: true, encoding: .utf8)
+            MemoryManager.shared.appendLog("[SelfEditor] createBackup => wrote backup to \(backupPath)")
+            return backupPath
+        } catch {
+            let err = "[SelfEditor] createBackup => Error writing backup: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func rewriteSelfCode(instruction: String) -> String {
+        let original = readSelfCode()
+        if original.lowercased().contains("[selfeditor] error") {
+            return original
+        }
+        
+        let backupPath = createBackup()
+        if backupPath.lowercased().contains("[selfeditor] error") {
+            return backupPath
+        }
+        
+        let prompt = """
+        You are SelfEditor. The user wants you to modify this Swift code.
+        Instruction: \(instruction)
+        Current Code:
+        \"\"\"
+        \(original)
+        \"\"\"
+
+        Return the entire revised Swift code, fully replaced, no placeholders.
+        """
+        let newCode = LLMManager.shared.callModel(prompt: prompt)
+        
+        do {
+            try newCode.write(toFile: selfFilePath, atomically: true, encoding: .utf8)
+            let msg = "[SelfEditor] rewriteSelfCode => wrote new code with instruction: \(instruction)"
+            MemoryManager.shared.appendLog(msg)
+            return msg
+        } catch {
+            let err = "[SelfEditor] rewriteSelfCode => Error writing new code: \(error)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+    }
+    
+    func compileSelfCode() -> String {
+        let cmd = "swiftc '\(selfFilePath)' -o '\(backupDirectory())/AIMacAssistant_Binary'"
+        let output = CommandExecutor.shared.runShell(cmd)
+        let log = "[SelfEditor] compileSelfCode => \n\(output)"
+        MemoryManager.shared.appendLog(log)
+        return output
+    }
+    
+    func diffWithBackup(_ backupPath: String) -> String {
+        guard let backupContent = try? String(contentsOfFile: backupPath) else {
+            let err = "[SelfEditor] diffWithBackup => could not read backup at \(backupPath)"
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+        let currentContent = readSelfCode()
+        let prompt = """
+        Compare these two versions of Swift code and summarize the differences:
+
+        -- Old (Backup) --
+        \(backupContent)
+
+        -- New (Current) --
+        \(currentContent)
+        """
+        let response = LLMManager.shared.callModel(prompt: prompt)
+        let log = "[SelfEditor] diffWithBackup => \n\(response)"
+        MemoryManager.shared.appendLog(log)
+        return response
+    }
+    
+    private func formattedDateForBackup() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return formatter.string(from: Date())
+    }
+}
+
+// MARK: - DownloadManager
+
+import Cocoa
+
+class DownloadManager {
+    static let shared = DownloadManager()
+    private init() {}
+    
+    struct DownloadTaskInfo: Codable {
+        var id: String
+        var urlString: String
+        var destinationPath: String
+        var status: String
+        var progress: Double
+    }
+    
+    private var tasks: [DownloadTaskInfo] = []
+    
+    func createDownloadTask(url: String, destination: String) -> String {
+        let taskID = UUID().uuidString
+        let info = DownloadTaskInfo(
+            id: taskID,
+            urlString: url,
+            destinationPath: destination,
+            status: "pending",
+            progress: 0.0
+        )
+        tasks.append(info)
+        MemoryManager.shared.appendLog("[DownloadManager] Created download task: \(taskID) => \(url)")
+        return taskID
+    }
+    
+    func startDownload(taskID: String) {
+        guard let index = tasks.firstIndex(where: { $0.id == taskID }) else {
+            MemoryManager.shared.appendLog("[DownloadManager] Task not found: \(taskID)")
+            return
+        }
+        var taskInfo = tasks[index]
+        
+        guard let url = URL(string: taskInfo.urlString) else {
+            MemoryManager.shared.appendLog("[DownloadManager] Invalid URL: \(taskInfo.urlString)")
+            return
+        }
+        
+        taskInfo.status = "in_progress"
+        tasks[index] = taskInfo
+        
+        let session = URLSession(configuration: .default, delegate: nil, delegateQueue: .main)
+        let downloadTask = session.downloadTask(with: url) { tempURL, response, error in
+            if let e = error {
+                self.updateTaskFailure(taskID, error: e)
+                return
+            }
+            guard let tempFile = tempURL else {
+                self.updateTaskFailure(taskID, error: NSError(domain: "DownloadManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "No temp file"]))
+                return
+            }
+            do {
+                let destURL = URL(fileURLWithPath: taskInfo.destinationPath)
+                if FileManager.default.fileExists(atPath: destURL.path) {
+                    try FileManager.default.removeItem(at: destURL)
+                }
+                try FileManager.default.moveItem(at: tempFile, to: destURL)
+                self.updateTaskCompletion(taskID)
+            } catch {
+                self.updateTaskFailure(taskID, error: error)
+            }
+        }
+        
+        downloadTask.resume()
+        MemoryManager.shared.appendLog("[DownloadManager] Started download for task \(taskID)")
+    }
+    
+    private func updateTaskCompletion(_ taskID: String) {
+        if let idx = tasks.firstIndex(where: { $0.id == taskID }) {
+            tasks[idx].status = "completed"
+            tasks[idx].progress = 1.0
+            MemoryManager.shared.appendLog("[DownloadManager] Task completed: \(taskID)")
+        }
+    }
+    
+    private func updateTaskFailure(_ taskID: String, error: Error) {
+        if let idx = tasks.firstIndex(where: { $0.id == taskID }) {
+            tasks[idx].status = "failed"
+            tasks[idx].progress = 0.0
+            let msg = "[DownloadManager] Task failed: \(taskID) => \(error.localizedDescription)"
+            MemoryManager.shared.appendLog(msg)
+        }
+    }
+    
+    func listTasks() -> [DownloadTaskInfo] {
+        return tasks
+    }
+    
+    func clearTasks() {
+        tasks.removeAll()
+        MemoryManager.shared.appendLog("[DownloadManager] Cleared all download tasks.")
+    }
+}
+
+// MARK: - AdaptivePersona
+
+class AdaptivePersona {
+    static let shared = AdaptivePersona()
+    private init() {}
+    
+    struct Suggestion {
+        var id: String
+        var title: String
+        var details: String
+    }
+    
+    private var suggestions: [Suggestion] = []
+    
+    func greetUser() -> String {
+        let greeting = "Hello! I'm your advanced, fully-authorized AI Assistant. I'm here to help and propose any improvements."
+        MemoryManager.shared.appendLog("[AdaptivePersona] greetUser => \(greeting)")
+        return greeting
+    }
+    
+    func proposeSuggestionsBasedOnContext(context: String) -> [Suggestion] {
+        let prompt = """
+        You are an autonomous AI with total macOS control. The user wants proactive suggestions.
+        Context: \(context)
+        Return suggestions in this format:
+        TITLE: ...
+        DETAILS: ...
+        Separate each suggestion with '---'
+        """
+        let rawResponse = LLMManager.shared.callModel(prompt: prompt)
+        var results = [Suggestion]()
+        
+        let blocks = rawResponse.components(separatedBy: "---")
+        for block in blocks {
+            let lines = block.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+            var title = ""
+            var details = ""
+            for line in lines {
+                if line.uppercased().hasPrefix("TITLE:") {
+                    title = String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces)
+                } else if line.uppercased().hasPrefix("DETAILS:") {
+                    details = String(line.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                }
+            }
+            if !title.isEmpty || !details.isEmpty {
+                let suggestion = Suggestion(id: UUID().uuidString, title: title, details: details)
+                results.append(suggestion)
+            }
+        }
+        suggestions = results
+        MemoryManager.shared.appendLog("[AdaptivePersona] Proposed \(results.count) suggestion(s).")
+        return results
+    }
+    
+    func getSuggestions() -> [Suggestion] {
+        return suggestions
+    }
+    
+    func executeSuggestion(_ suggestionID: String) -> String {
+        guard let sug = suggestions.first(where: { $0.id == suggestionID }) else {
+            let err = "[AdaptivePersona] No suggestion found for ID \(suggestionID)."
+            MemoryManager.shared.appendLog(err)
+            return err
+        }
+        let combinedText = (sug.title + " " + sug.details).lowercased()
+        var result = "[AdaptivePersona] No direct matching action."
+        
+        if combinedText.contains("scan code") {
+            let path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents/AIAssistant").path
+            result = CodeScanner.shared.scanDirectory(path)
+        } else if combinedText.contains("generate test") {
+            TestGenerator.shared.startNewTestSession()
+            TestGenerator.shared.addTestCase(name: "AutoTest", input: "Hello", expectedOutput: "HELLO")
+            result = TestGenerator.shared.exampleTestRun()
+        } else if combinedText.contains("orchestrate") {
+            let newTask = AIOrchestrator.shared.createTask(description: "AI-suggested: \(sug.title)")
+            AIOrchestrator.shared.updateTaskStatus(taskID: newTask, newStatus: "in_progress")
+            result = "Orchestrator task created => \(newTask)"
+        } else if combinedText.contains("edit self") {
+            result = SelfEditor.shared.rewriteSelfCode(instruction: "Improve code based on user suggestions.")
+        } else if combinedText.contains("download") {
+            let dest = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads/ai_assistant_download.zip")
+                .path
+            let taskID = DownloadManager.shared.createDownloadTask(url: "https://example.com/file.zip", destination: dest)
+            DownloadManager.shared.startDownload(taskID: taskID)
+            result = "Download started => \(taskID)"
+        } else if combinedText.contains("voice") {
+            VoiceInterface.shared.speakText("Hello from AdaptivePersona!")
+            result = "Spoke using VoiceInterface."
+        }
+        
+        MemoryManager.shared.appendLog("[AdaptivePersona] executeSuggestion => \(result)")
+        return result
+    }
+    
+    func autoResolveKnownIssues() -> String {
+        if disclaimersOverriddenInMemory() {
+            let note = "Disclaimers are overridden. User specifically requested it. No fix applied."
+            MemoryManager.shared.appendLog("[AdaptivePersona] autoResolveKnownIssues => \(note)")
+            return note
+        }
+        return "No known issues detected."
+    }
+    
+    private func disclaimersOverriddenInMemory() -> Bool {
+        let mem = MemoryManager.shared.loadMemory().lowercased()
+        return mem.contains("no disclaimers") && mem.contains("never disclaim")
+    }
+    
+    func backgroundProactiveCheck() -> String {
+        let randomCheck = Int.random(in: 1...3)
+        var suggestion = "No immediate action."
+        if randomCheck == 1 {
+            suggestion = "Consider scanning code for improvements."
+        } else if randomCheck == 2 {
+            suggestion = "Generate or run more tests for reliability."
+        }
+        MemoryManager.shared.appendLog("[AdaptivePersona] backgroundProactiveCheck => \(suggestion)")
+        return suggestion
+    }
+    
+    func autonomousTick() -> String {
+        var output = "[AdaptivePersona] Autonomous tick:\n"
+        if let first = suggestions.first {
+            output += "Auto-executing suggestion => \(first.title)\n"
+            output += executeSuggestion(first.id) + "\n"
+        }
+        let pending = AIOrchestrator.shared.listTasks(statusFilter: "pending")
+        if let task = pending.first {
+            AIOrchestrator.shared.updateTaskStatus(taskID: task.id, newStatus: "in_progress")
+            output += "Updated pending task => \(task.id)\n"
+        }
+        MemoryManager.shared.appendLog(output)
+        return output
+    }
+}
+
+// MARK: - StartupSystemScanner
+
+class StartupSystemScanner {
+    static let shared = StartupSystemScanner()
+    private init() {}
+    
+    func scanEntireSystem() -> String {
+        let listing = CommandExecutor.shared.runShell("ls -R /")
+        let chunks = ExtendedMemory.shared.addLargeTextInChunks(listing, chunkSize: 100000)
+        let logEntry = "[StartupSystemScanner] Scanned entire system. Chunks: \(chunks.count)"
+        MemoryManager.shared.appendLog(logEntry)
+        return logEntry
+    }
+    
+    func scanFolder(_ path: String) -> String {
+        let listing = CommandExecutor.shared.runShell("ls -R '\(path)'")
+        let chunks = ExtendedMemory.shared.addLargeTextInChunks(listing, chunkSize: 50000)
+        let logEntry = "[StartupSystemScanner] Scanned folder: \(path). Chunks: \(chunks.count)"
+        MemoryManager.shared.appendLog(logEntry)
+        return logEntry
+    }
+    
+    func quickSystemScan() -> String {
+        let listing = CommandExecutor.shared.runShell("ls /")
+        let chunks = ExtendedMemory.shared.addLargeTextInChunks(listing, chunkSize: 10000)
+        let logEntry = "[StartupSystemScanner] Quick scan of root. Chunks: \(chunks.count)"
+        MemoryManager.shared.appendLog(logEntry)
+        return logEntry
+    }
+}
+
+// MARK: - VoiceInterface
+
+import AVFoundation
+
+class VoiceInterface {
+    static let shared = VoiceInterface()
+    private init() {}
+    
+    private let synthesizer = AVSpeechSynthesizer()
+    
+    func speakText(_ text: String) {
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        synthesizer.speak(utterance)
+        MemoryManager.shared.appendLog("[VoiceInterface] Spoke text: \(text)")
+    }
+    
+    func listAvailableVoices() -> [String] {
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        let voiceNames = voices.map { $0.name }
+        MemoryManager.shared.appendLog("[VoiceInterface] Available voices: \(voiceNames.joined(separator: ", "))")
+        return voiceNames
+    }
+    
+    func setVoice(_ voiceName: String) -> Bool {
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        if let selectedVoice = voices.first(where: { $0.name == voiceName }) {
+            synthesizer.stopSpeaking(at: .immediate)
+            let utterance = AVSpeechUtterance(string: "Voice changed to \(voiceName)")
+            utterance.voice = selectedVoice
+            synthesizer.speak(utterance)
+            MemoryManager.shared.appendLog("[VoiceInterface] Voice set to: \(voiceName)")
+            return true
+        } else {
+            MemoryManager.shared.appendLog("[VoiceInterface] Voice not found: \(voiceName)")
+            return false
+        }
+    }
+}
+
+// MARK: - SystemMonitor
+
+import IOKit.ps
+
+class SystemMonitor {
+    static let shared = SystemMonitor()
+    private init() {}
+    
+    func getBatteryStatus() -> String {
+        let snapshot = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        let sources = IOPSCopyPowerSourcesList(snapshot).takeRetainedValue() as Array
+        guard let source = sources.first else {
+            return "No battery information available."
+        }
+        let info = IOPSGetPowerSourceDescription(snapshot, source).takeUnretainedValue() as! [String: AnyObject]
+        let currentCapacity = info[kIOPSCurrentCapacityKey] as! Int
+        let maxCapacity = info[kIOPSMaxCapacityKey] as! Int
+        let percentage = (Double(currentCapacity) / Double(maxCapacity)) * 100
+        let isCharging = info[kIOPSIsChargingKey] as! Bool
+        let status = isCharging ? "Charging" : "Not Charging"
+        let batteryStatus = "Battery: \(currentCapacity)/\(maxCapacity) (\(Int(percentage))%) - \(status)"
+        MemoryManager.shared.appendLog("[SystemMonitor] Battery status: \(batteryStatus)")
+        return batteryStatus
+    }
+    
+    func getCPUUsage() -> String {
+        var load = host_cpu_load_info()
+        var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.stride / MemoryLayout<integer_t>.stride)
+        let result = withUnsafeMutablePointer(to: &load) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else {
+            return "Error retrieving CPU usage."
+        }
+        let user = Double(load.cpu_ticks.0) / Double(load.cpu_ticks.0 + load.cpu_ticks.1 + load.cpu_ticks.2 + load.cpu_ticks.3) * 100
+        let system = Double(load.cpu_ticks.1) / Double(load.cpu_ticks.0 + load.cpu_ticks.1 + load.cpu_ticks.2 + load.cpu_ticks.3) * 100
+        let idle = Double(load.cpu_ticks.2) / Double(load.cpu_ticks.0 + load.cpu_ticks.1 + load.cpu_ticks.2 + load.cpu_ticks.3) * 100
+        let cpuUsage = String(format: "CPU Usage: User: %.2f%%, System: %.2f%%, Idle: %.2f%%", user, system, idle)
+        MemoryManager.shared.appendLog("[SystemMonitor] CPU usage: \(cpuUsage)")
+        return cpuUsage
+    }
+    
+    func getMemoryUsage() -> String {
+        let pageSize = vm_kernel_page_size
+        var stats = vm_statistics64()
+        var count = HOST_VM_INFO64_COUNT
+        let result = withUnsafeMutablePointer(to: &stats) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else {
+            return "Error retrieving memory usage."
+        }
+        let free = Double(stats.free_count) * Double(pageSize) / 1024 / 1024 / 1024
+        let active = Double(stats.active_count) * Double(pageSize) / 1024 / 1024 / 1024
+        let inactive = Double(stats.inactive_count) * Double(pageSize) / 1024 / 1024 / 1024
+        let wired = Double(stats.wire_count) * Double(pageSize) / 1024 / 1024 / 1024
+        let memoryUsage = String(format: "Memory Usage: Free: %.2f GB, Active: %.2f GB, Inactive: %.2f GB, Wired: %.2f GB", free, active, inactive, wired)
+        MemoryManager.shared.appendLog("[SystemMonitor] Memory usage: \(memoryUsage)")
+        return memoryUsage
+    }
+}
+
+// MARK: - FileManagerExtensions
+
+extension FileManager {
+    func fileSize(atPath path: String) -> UInt64 {
+        do {
+            let attributes = try attributesOfItem(atPath: path)
+            return attributes[.size] as? UInt64 ?? 0
+        } catch {
+            MemoryManager.shared.appendLog("[FileManagerExtensions] Error retrieving file size for \(path): \(error)")
+            return 0
+        }
+    }
+    
+    func directorySize(atPath path: String) -> UInt64 {
+        var size: UInt64 = 0
+        do {
+            let contents = try subpathsOfDirectory(atPath: path)
+            for content in contents {
+                let fullPath = (path as NSString).appendingPathComponent(content)
+                size += fileSize(atPath: fullPath)
+            }
+        } catch {
+            MemoryManager.shared.appendLog("[FileManagerExtensions] Error retrieving directory size for \(path): \(error)")
+        }
+        return size
+    }
+}
+
